@@ -1,8 +1,8 @@
 # base image      
-FROM alpine:3.10 
+FROM alpine:3.9.2 
 #FROM alpine:3.9.2  #vulnerable
 #FROM alpine:3.10     #ok
- 
+  
 WORKDIR /usr/src/app
 # Copy files required for the app to run, see .dockerignore
 COPY . /usr/src/app
