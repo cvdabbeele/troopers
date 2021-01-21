@@ -11,12 +11,20 @@ phases:
       - cp smcert.crt /usr/local/share/ca-certificates/$SMARTCHECK_HOST.crt
       - update-ca-certificates
       - apt-get update && apt-get -y install jq python3-pip python3-dev && pip3 install --upgrade awscli
+ 
+
   pre_build:
     commands:
-        - TAG="$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c 8)"
-        - sed -i 's@CONTAINER_IMAGE@'"$REPOSITORY_URI:$TAG"'@' app-eks.yml
-        - $(aws ecr get-login --no-include-email)
-        - export KUBECONFIG=$HOME/.kube/config
+      - TAG="$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c 8)"
+      - sed -i 's@CONTAINER_IMAGE@'"$REPOSITORY_URI:latest"'@' app-eks.yml
+      - $(aws ecr get-login --no-include-email)
+      - export KUBECONFIG=$HOME/.kube/config
+      - echo "--------------------------------Logging in to docker hub --------------------------------------------------------------"
+      - echo $DOCKERHUB_PASSWORD | docker login --username $DOCKERHUB_USERNAME --password-stdin
+      - echo "--------------------------------getting current pull-rate state from docker hub----------------------------------------"
+      - TOKEN=$(curl  --user "${$DOCKERHUB_USERNAME}:${$DOCKERHUB_PASSWORD}" "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
+      - curl --head -H "Authorization:Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep -i rate
+      # echo if the curl call did not return any RateLimits, then you probably have a paid DockerHub account 
   build:
     commands:
       - docker build --tag $REPOSITORY_URI:$TAG .
@@ -25,11 +33,16 @@ phases:
     commands:
       - echo "$REPOSITORY_URI:$TAG"
       - $(aws ecr get-login --no-include-email)
+
+      - echo 'Triggering a pre-registry scan'
+      - echo 'scans the container image before it is being pushed to the ECR registry'
+      - echo 'This ensures that we only get clean images in the ECR'
+      - echo 'Adjust the --findings-threshold, here below, to set which type and how many vulnerabilities you want to allow'
       - >-
         docker run -v /var/run/docker.sock:/var/run/docker.sock
         deepsecurity/smartcheck-scan-action
         --image-name="$REPOSITORY_URI:$TAG"
-        --findings-threshold="{\"malware\":0,\"vulnerabilities\":{\"defcon1\":0,\"critical\":100,\"high\":100},\"contents\":{\"defcon1\":0,\"critical\":0,\"high\":1},\"checklists\":{\"defcon1\":0,\"critical\":0,\"high\":0}}"
+        --findings-threshold="{\"malware\":0,\"vulnerabilities\":{\"defcon1\":0,\"critical\":150,\"high\":150},\"contents\":{\"defcon1\":0,\"critical\":0,\"high\":1},\"checklists\":{\"defcon1\":0,\"critical\":0,\"high\":0}}"
         --preregistry-host="$SMARTCHECK_HOST:5000"
         --smartcheck-host="$SMARTCHECK_HOST"
         --smartcheck-user="$SMARTCHECK_USER"
@@ -40,32 +53,39 @@ phases:
         --preregistry-password="$PRE_SCAN_PWD"
       - $(aws ecr get-login --no-include-email)
       - docker push $REPOSITORY_URI:$TAG
-      - sleep 60
+      - docker tag $REPOSITORY_URI:$TAG $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:latest
+      - echo 'giving the previous push command some time to settle'
+      - sleep 10
+
+      - echo 'scanning the container again, but now in the ECR registry, so we can leverage the scan results in CloudOneContainerSecurity'
       - >-
         docker run -v /var/run/docker.sock:/var/run/docker.sock
         deepsecurity/smartcheck-scan-action
-        --image-name="$REPOSITORY_URI:$TAG"
-        --findings-threshold="{\"malware\":0,\"vulnerabilities\":{\"defcon1\":0,\"critical\":100,\"high\":100},\"contents\":{\"defcon1\":0,\"critical\":0,\"high\":1},\"checklists\":{\"defcon1\":0,\"critical\":0,\"high\":0}}"
+        --image-name="$REPOSITORY_URI:latest"
+        --findings-threshold="{\"malware\":0,\"vulnerabilities\":{\"defcon1\":0,\"critical\":150,\"high\":150},\"contents\":{\"defcon1\":0,\"critical\":0,\"high\":0},\"checklists\":{\"defcon1\":0,\"critical\":0,\"high\":1}}"
         --smartcheck-host="$SMARTCHECK_HOST"
         --smartcheck-user="$SMARTCHECK_USER"
         --smartcheck-password="$SMARTCHECK_PWD"
         --insecure-skip-tls-verify="true"
         --image-pull-auth="{\"aws\":{\"region\":\"${AWS_REGION}\",\"accessKeyID\":\"${AWS_ACCESS_KEY_ID}\",\"secretAccessKey\":\"${AWS_SECRET_ACCESS_KEY}\"}}"
-
-
+      
       - CREDENTIALS=$(aws sts assume-role --role-arn $EKS_KUBECTL_ROLE_ARN --role-session-name codebuild-kubectl --duration-seconds 900)
       - export AWS_ACCESS_KEY_ID="$(echo ${CREDENTIALS} | jq -r '.Credentials.AccessKeyId')"
       - export AWS_SECRET_ACCESS_KEY="$(echo ${CREDENTIALS} | jq -r '.Credentials.SecretAccessKey')"
       - export AWS_SESSION_TOKEN="$(echo ${CREDENTIALS} | jq -r '.Credentials.SessionToken')"
       - export AWS_EXPIRATION=$(echo ${CREDENTIALS} | jq -r '.Credentials.Expiration')
-      
       - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME
       - sed -i s/\$APPSEC_KEY/$APPSEC_KEY/g app-eks.yml
       - sed -i s/\$APPSEC_SECRET/$APPSEC_SECRET/g app-eks.yml
-      
+      - cat app-eks.yml
       - kubectl apply -f app-eks.yml
       - printf '[{"name":"c1-app-sec-moneyx","imageUri":"%s"}]' $REPOSITORY_URI:$TAG > build.json
+      - echo "--------------------------------getting current pull-rate state from docker hub----------------------------------------"
+      - TOKEN=$(curl  --user "${$DOCKERHUB_USERNAME}:${$DOCKERHUB_PASSWORD}" "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
+      - curl --head -H "Authorization:Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep -i rate
+      # echo if the curl call did not return any RateLimits, then you probably have a paid DockerHub account 
 
-      - printf '[{"name":"troopers","imageUri":"%s"}]' $REPOSITORY_URI:$TAG > build.json
+
 artifacts:
   files: build.json
